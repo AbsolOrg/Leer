@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-VERSION="0.6.2"
+VERSION="0.7.1"
 CONF_PATH="${LEER_CONF:-/etc/leer.conf}"
 LEER_BIN="${LEER_BIN:-/usr/local/bin/leer}"      # self-path used in generated units; overridable for tests
 UNIT_DIR="${LEER_UNIT_DIR:-/etc/systemd/system}" # sandbox: point elsewhere to skip systemctl
@@ -540,221 +540,6 @@ cmd_schedule() {
     esac
 }
 
-# ------------------------- GUI hub -------------------------
-
-gui_ask() {  # pops next scripted answer from $ZENITY_SCRIPT_FILE when testing
-    if [[ -n ${ZENITY_SCRIPT_FILE:-} ]]; then
-        local line rest
-        IFS= read -r line < "$ZENITY_SCRIPT_FILE" || return 1
-        rest=$(tail -n +2 "$ZENITY_SCRIPT_FILE")
-        printf '%s\n' "$rest" > "$ZENITY_SCRIPT_FILE"
-        [[ -n $line && $line != SKIP ]] || return 1
-        printf '%s\n' "$line"
-        return 0
-    fi
-    zenity "$@" 2>/dev/null
-}
-
-gui_escalate() {  # run remaining args as root: pkexec -> zenity-password sudo -> guidance
-    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then "$@"; return $?; fi
-    local bin out rc=0 pw
-    bin=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || bin="$LEER_BIN"
-    [[ -x $bin ]] || { zenity --error --text="leer binary not found" 2>/dev/null; return 1; }
-    [[ ${1:-} == leer ]] && shift      # tolerate legacy "leer cmd…" style callers
-
-    if command -v pkexec >/dev/null; then
-        out=$(pkexec "$bin" "$@" 2>&1) && return 0
-        # failure often = no polkit agent on WMs (Hyprland etc.); fall through to sudo
-    fi
-
-    pw=$(zenity --password --title="leer needs administrator rights" \
-         2>/dev/null) || {
-        zenity --error --title="leer" \
-            --text="Authentication cancelled.\nManual equivalent:\n  sudo $(basename "$bin") $*" 2>/dev/null
-        return 1
-    }
-    out=$(printf '%s\n' "$pw" | sudo -S -p '' "$bin" "$@" 2>&1) || rc=$?
-    unset pw
-    (( rc == 0 )) && return 0
-    zenity --error --title="leer" \
-        --text="Action failed:\n${out##*$'\n'}\n\nManual equivalent:\n  sudo $(basename "$bin") $*" 2>/dev/null
-    return $rc
-}
-
-gui_snap() {
-    local out rc=0
-    out=$(gui_escalate leer snap --tag gui 2>&1) || rc=$?
-    if (( rc == 0 )); then
-        gui_ask --info --title="leer" --text="Snapshot created." >/dev/null
-        return 0
-    fi
-    gui_ask --error --title="leer" --text="Snapshot failed:\n${out##*$'\n'}" >/dev/null
-    return $rc
-}
-
-gui_restore() {
-    local ids=() rows=() s id tag date pick plan rc=0
-    while IFS= read -r s; do
-        id=$s
-        tag=$(sed -n 's/^TAG=//p' "$SNAP_DIR/$s/MANIFEST")
-        date=$(sed -n 's/^DATE_ISO=//p' "$SNAP_DIR/$s/MANIFEST")
-        rows+=("$id" "${date%%+*}" "${tag:--}")
-    done < <(snapshots)
-    (( ${#rows[@]} )) || { gui_ask --info --text="No snapshots yet." >/dev/null; return 0; }
-    id=$(gui_ask --list --radiolist --title="leer restore" \
-            --column "" --column "ID" --column "Date" --column "Tag" \
-            "${rows[@]}" --width=700 --height=420) || return 0
-    [[ -n $id ]] || return 0
-
-    SELECTED=(); SEL_ETC=no
-    pick_items "$SNAP_DIR/$id" || { gui_ask --info --text="Nothing selected." >/dev/null; return 0; }
-    build_excludes
-    plan=$(mktemp)
-    selected_run dry "$SNAP_DIR/$id" "$DEST_HOME" >"$plan" 2>/dev/null || true
-    { echo "Selected: ${SELECTED[*]:-}$([[ $SEL_ETC == yes ]] && echo ' <etc>')"
-      echo; head -60 "$plan"; } >"$plan.f"
-    mv "$plan.f" "$plan"
-    gui_ask --question --title="Apply restore?" --width=520 \
-           --text="$(head -c 1500 "$plan")
-
-Write these changes to your live system?" >/dev/null || { rm -f "$plan"; return 0; }
-    rm -f "$plan"
-    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-        selected_run apply "$SNAP_DIR/$id" "$DEST_HOME"
-        if [[ $SEL_ETC == yes ]] && snap_captured_etc "$SNAP_DIR/$id"; then
-            etc_run apply "$SNAP_DIR/$id/etc" "$DEST_ETC/"
-        fi
-    else
-        local esc=(__gui_apply "$id")
-        [[ $SEL_ETC == yes ]] && esc+=(--etc)
-        esc+=(${SELECTED[@]+"${SELECTED[@]}"})
-        if ! out=$(gui_escalate "${esc[@]}" 2>&1); then
-            gui_ask --error --title="leer" --text="Restore failed:\n${out##*$'\n'}" >/dev/null
-            return 1
-        fi
-    fi
-    gui_ask --info --text="Restore complete.\nRe-login / restart your session." >/dev/null
-}
-
-gui_schedule() {
-    local cur cal choice custom
-    cur=$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer" 2>/dev/null || true)
-    choice=$(gui_ask --list --radiolist --title="leer schedule" \
-        --text="Current: ${cur:-off}" \
-        --column "" --column "Preset" \
-        FALSE Off FALSE Hourly FALSE Daily FALSE Weekly FALSE Monthly FALSE Yearly FALSE "Custom…" \
-        --width=440 --height=360) || { return 0; }
-    case $choice in
-        "") return 0;;
-        Off) gui_escalate leer schedule off; return 0;;
-        Custom…)
-            custom=$(gui_ask --entry --title="Custom OnCalendar" \
-                     --text="systemd calendar expression\ne.g. Mon..Fri 09:00 or 2026-*-01 04:00" \
-                     --entry-text="${cur:-daily}") || return 0
-            [[ -n $custom ]] || return 0
-            gui_escalate leer schedule set --at "$custom"; return 0;;
-        Hourly) cal=hourly;; Daily) cal=daily;; Weekly) cal=weekly;;
-        Monthly) cal=monthly;; Yearly) cal=yearly;;
-    esac
-    gui_escalate leer schedule set "$cal"
-}
-
-gui_manage() {
-    local act id n
-    act=$(gui_ask --list --title="Manage snapshots" --column "Action" \
-            "Drop a snapshot…" "Prune (keep newest N)…" "Back" \
-            --height=240 --width=380) || return 0
-    case $act in
-        "Drop a snapshot…"*)
-            id=$(gui_ask --list --radiolist --title="Drop snapshot" \
-                 --column "" --column ID --column Tag \
-                 $(
-                   while IFS= read -r s; do
-                       printf '%s %s %q ' FALSE "$s" "$(sed -n 's/^TAG=//p' "$SNAP_DIR/$s/MANIFEST")"
-                   done < <(snapshots)
-                 ) --width=560 --height=400) || return 0
-            [[ -n $id ]] || return 0
-            gui_ask --question --title="Confirm drop" \
-                    --text="Permanently delete snapshot $id?" >/dev/null \
-                && gui_escalate leer drop "$id" --yes
-            ;;
-        "Prune"*)
-            n=$(gui_ask --entry --title="Prune" --text="Keep newest N snapshots:" \
-                --entry-text="${LEER_KEEP}") || return 0
-            [[ $n =~ ^[0-9]+$ ]] && gui_escalate leer prune "$n"
-            ;;
-    esac
-}
-
-classic_hub() {
-    load_conf
-    command -v zenity >/dev/null || die "GUI requires zenity (pacman -S zenity)"
-    local choice
-    while :; do
-        choice=$(zenity --list --title="leer v$VERSION" \
-            --column "Action" \
-            "Create snapshot now" "Restore…" "Schedule…" "Manage snapshots…" "Doctor" "Quit" \
-            --width=430 --height=330 2>/dev/null) || exit 0
-        case $choice in
-            "Create snapshot now") gui_snap ;;
-            Restore*)              gui_restore ;;
-            Schedule*)             gui_schedule ;;
-            Manage* )              gui_manage ;;
-            Doctor)                cmd_doctor | gui_ask --text-info --title="leer doctor" \
-                                            --width=620 --height=420 --font=monospace >/dev/null ;;
-            *)                     exit 0 ;;
-        esac
-    done
-}
-
-cmd_doctor() {
-    load_conf
-    local fail=0
-    chk() {
-        local desc=$1; shift
-        if "$@" >/dev/null 2>&1; then
-            printf '  [ok]   %s\n' "$desc"
-        else
-            printf '  [FAIL] %s\n' "$desc"
-            fail=$((fail + 1))
-        fi
-    }
-    info "leer doctor v$VERSION"
-    chk "rsync available"     rsync --version
-    chk "pacman available"    pacman -Q
-    if command -v zenity >/dev/null; then
-        printf '  [ok]   zenity available (GUI file picker)\n'
-    else
-        printf '  [--]   zenity not found — GUI picker unavailable (numbered TTY picker always works)\n'
-    fi
-    chk "snapshot dir usable" test -w "$SNAP_DIR"
-    chk "config loaded"       test -n "${LEER_KEEP:-}"
-
-    local n=0 s
-    for s in $(snapshots); do n=$((n + 1)); done
-    if (( n > 0 )); then
-        printf '  [ok]   %d snapshot(s) present\n' "$n"
-    else
-        printf '  [--]   no snapshots yet (run: sudo leer snap)\n'
-    fi
-
-    if [[ -f $UNIT_DIR/leer-snapshot.timer ]]; then
-        printf '  [ok]   schedule installed (%s)\n' \
-            "$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer")"
-    else
-        printf '  [--]   no schedule configured (optional: leer gui > Schedule)\n'
-    fi
-
-    if (( fail > 0 )); then
-        die "doctor found $fail failing check(s)"
-    fi
-}
-
-# ------------------------- selective restore (picker) -------------------------
-
-SELECTED=()      # chosen home-relative items; dirs carry trailing slash
-TTY_ITEMS=()     # selections coming from the TTY numbered picker
-SEL_ETC=no
 
 inventory_items() {  # $1=snapshot root -> "relpath<TAB>kind" lines
     local p sub name
@@ -787,24 +572,16 @@ change_map() {  # $1=snap_root $2=outfile : one changed relpath per line
     } >>"$2" || true
 }
 
+is_dir_item() {  # $1=inv-file $2=item (no trailing slash) -> 0 if captured as directory
+    grep -q "^${2}/	" "$1" 2>/dev/null
+}
+
+
 item_changed() {  # $1=changes-file $2=item -> "Mm/Dd" summary or "-"
     local item=$2 bare=${2%/} total dels m
     total=$(grep -c "^${bare}\(/\|$\)" "$1" || true)
     dels=$(grep "^\*deleting ${bare}\(/\|$\)" "$1" 2>/dev/null | wc -l)
     if (( total > 0 )); then printf '%dm/%dd' "$((total - dels))" "$dels"; else printf -- '-'; fi
-}
-
-build_rows() {  # $1=inv-file -> prints "STATE path summary" triples for zenity checklists
-    local item kind state summary
-    while IFS=$'\t' read -r item kind; do
-        summary=$(item_changed "$1" "$item")
-        [[ $summary == '-' ]] && state=FALSE || state=TRUE
-        printf '%s %q %s ' "$state" "${item%/}" "$summary"
-    done <"$1"
-}
-
-is_dir_item() {  # $1=inv-file $2=item (no trailing slash) -> 0 if captured as directory
-    grep -q "^${2}/	" "$1" 2>/dev/null
 }
 
 tty_pick() {  # $1=inv-file ; fills TTY_ITEMS[] (+SEL_ETC) from numbered menu on stdin
@@ -827,60 +604,73 @@ tty_pick() {  # $1=inv-file ; fills TTY_ITEMS[] (+SEL_ETC) from numbered menu on
         item=${lines[n-1]}
         case $item in
             etc) SEL_ETC=yes ;;
-            *)   is_dir_item "$1" "${item%/}" && TTY_ITEMS+=("${item}/") || TTY_ITEMS+=("$item") ;;
+            *)   d="${item%/}"; is_dir_item "$1" "$d" && TTY_ITEMS+=("$d/") || TTY_ITEMS+=("$d") ;;
         esac
     done
-    (( ${#TTY_ITEMS[@]} > 0 || $SEL_ETC == yes )) || return 1
+    if [[ -z $SEL_ETC && ${#TTY_ITEMS[@]} -eq 0 ]]; then return 1; fi
     return 0
 }
 
-pick_items() {  # $1=snap root ; fills SELECTED[] + SEL_ETC ; rc 0=selection made
-    local inv changes item kind state summary sel
+pick_items() {  # $1=snap root ; fills SELECTED[] + SEL_ETC via terminal menu ; rc 0=selection made
+    local inv changes rc
     inv=$(mktemp); changes=$(mktemp)
     inventory_items "$1" >"$inv"
     : >"$changes"
     change_map "$1" "$changes"
-
-    # --- build dialog selection source: scripted queue / zenity / TTY ---
-    if [[ -n ${ZENITY_SCRIPT_FILE:-} ]]; then
-        sel=$(gui_ask --list --checklist --title="leer restore $(basename "$1")" \
-                --text="Pre-checked = differs from your current system." \
-                --column "" --column "Path" --column "Changes" \
-                $(build_rows "$inv")) || return 1
-    elif command -v zenity >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
-        sel=$(zenity --list --checklist --title="leer restore $(basename "$1")" \
-                --text="Pre-checked = differs from your current system.\nTick what to restore." \
-                --column "" --column "Path" --column "Changes" \
-                $(build_rows "$inv") --width=760 --height=620 2>/dev/null) || return 1
-    else
-        tty_pick "$inv"; rc=$?
-        (( rc == 0 )) || return $rc
-    fi
-
-    [[ -n ${sel:-} || -n ${TTY_ITEMS[*]:-} ]] || return 1
-
-    if (( ${#TTY_ITEMS[@]} > 0 )); then
-        SELECTED=("${TTY_ITEMS[@]}")
-    else
-        while IFS= read -r item; do
-            [[ -n $item ]] || continue
-            case $item in
-                etc) SEL_ETC=yes ;;
-                *)   is_dir_item "$inv" "$item" && SELECTED+=("${item}/") || SELECTED+=("$item") ;;
-            esac
-        done < <(printf '%s\n' "$sel" | tr '|' '\n')
-    fi
+    TTY_ITEMS=()
+    tty_pick "$inv"; rc=$?
     rm -f "$inv" "$changes"
-    [[ ${#SELECTED[@]} -gt 0 || $SEL_ETC == yes ]]
+    (( rc == 0 )) || return 1
+    SELECTED=("${TTY_ITEMS[@]}")
+    if [[ -z $SEL_ETC && ${#SELECTED[@]} -eq 0 ]]; then return 1; fi
+    return 0
 }
 
-match_selected() {  # $1=captured path -> 0 if covered by current selection
-    local s
-    for s in ${SELECTED[@]+"${SELECTED[@]}"}; do
-        [[ $1 == "${s%/}" || $1 == "${s%/}/"* ]] && return 0
-    done
-    return 1
+cmd_doctor() {
+    load_conf
+    local fail=0
+    chk() {
+        local desc=$1; shift
+        if "$@" >/dev/null 2>&1; then
+            printf '  [ok]   %s\n' "$desc"
+        else
+            printf '  [FAIL] %s\n' "$desc"
+            fail=$((fail + 1))
+        fi
+    }
+    info "leer doctor v$VERSION"
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        printf '  [i]    read-only doctor — rerun with sudo for write checks\n'
+    fi
+    chk "rsync available"     rsync --version
+    chk "pacman available"    pacman -Q
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        chk "snapshot dir usable" test -w "$SNAP_DIR"
+    else
+        printf '  [--]   snapshot store: present (write-check needs root — normal)\n'
+    fi
+    chk "config loaded"       test -n "${LEER_KEEP:-}"
+
+    local n=0 s
+    for s in $(snapshots); do n=$((n + 1)); done
+    if (( n > 0 )); then
+        printf '  [ok]   %d snapshot(s) present\n' "$n"
+    else
+        printf '  [--]   no snapshots yet (run: sudo leer snap)\n'
+    fi
+
+    if [[ -f $UNIT_DIR/leer-snapshot.timer ]]; then
+        printf '  [ok]   schedule installed (%s)\n' \
+            "$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer")"
+    else
+        printf '  [--]   no schedule configured (optional: sudo leer schedule set daily)\n'
+    fi
+
+    if (( fail > 0 )); then
+        die "doctor found $fail failing check(s)"
+    fi
 }
+
 
 # Transfer exactly the user-selected items (snapshot tree is the sender).
 selected_run() {  # mode=snapshot-root live-home
@@ -891,99 +681,11 @@ selected_run() {  # mode=snapshot-root live-home
         apply) act=(-aXH);;
     esac
     for s in ${SELECTED[@]+"${SELECTED[@]}"}; do
-        bare="${s%/}"
+        s="${s//\/\/\//\\/}"; bare="${s%/}"
         [[ -e $snap_root/home/$bare ]] || continue
         ( cd "$snap_root/home" && exec rsync ${act[@]+"${act[@]}"} --delete \
             ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} -R "./$bare" "$live_home/" )
     done
-}
-
-cmd_drop() {
-    local id=""
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --yes|-y) FORCE=yes; shift;;
-            -h|--help) printf 'usage: sudo leer drop <id> [--yes]\n'; exit 0;;
-            *) [[ -z $id ]] || die "drop: unexpected argument '$1'"; id=$1; shift;;
-        esac
-    done
-    [[ -n $id ]] || die "usage: sudo leer drop <id> [--yes]"
-    case $id in ''|.|..|*/*) die "unsafe snapshot id: '$id'";; esac
-    load_conf
-    need_root drop
-    [[ -f $SNAP_DIR/$id/MANIFEST ]] || die "no such snapshot: $id"
-    local total
-    total=$(snapshots | wc -l)
-    (( total > 1 )) || die "refusing to drop the only remaining snapshot"
-    if [[ $FORCE != yes ]]; then
-        read -r -p "Permanently delete snapshot '$id'? Type 'yes': " ans
-        [[ $ans == yes ]] || { info "aborted."; return 0; }
-    fi
-    rm -rf -- "${SNAP_DIR:?}/$id"
-    info "dropped: $id"
-}
-
-
-# ------------------------- persistent tray GUI (yad) -------------------------
-
-GUI_SELF=""   # resolved at runtime; menu items re-enter leer as hidden subactions
-
-gui_tray_menu_string() {
-    printf 'Snapshot now!%s __gui snap|Restore…!%s __gui restore|Schedule…!%s __gui schedule|Manage…!%s __gui manage|Doctor!%s __gui doctor|Quit!quit' \
-        "$GUI_SELF" "$GUI_SELF" "$GUI_SELF" "$GUI_SELF" "$GUI_SELF"
-}
-
-gui_subaction() {  # entry point used by tray menu items
-    load_conf
-    command -v zenity >/dev/null || die "subaction dialogs require zenity"
-    case ${1:-} in
-        snap)     gui_snap ;;
-        restore)  gui_restore ;;
-        schedule) gui_schedule ;;
-        manage)   gui_manage ;;
-        doctor)   cmd_doctor | yad --text-info --title="leer doctor" \
-                           --width=620 --height=420 --font=monospace >/dev/null 2>&1 ;;
-        *) die "unknown gui subaction" ;;
-    esac
-}
-
-cmd_gui() {
-    load_conf
-    [[ ${1:-} == "--classic" ]] && { classic_hub; return 0; }
-    if ! command -v yad >/dev/null; then
-        classic_hub      # graceful fallback when yad is absent
-        return 0
-    fi
-    GUI_SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$LEER_BIN")
-    info "leer tray icon started — click it for actions. (Run 'pkill -f \"yad --notification\"' to stop.)"
-    exec yad --notification \
-        --image="drive-multidisk" \
-        --text="leer v$VERSION — config recovery ready" \
-        --menu="$(gui_tray_menu_string)" 2>/dev/null
-}
-
-
-cmd_gui_apply() {  # hidden: id [--etc] item... — performs an escalated selective apply
-    local id="" etc=no
-    load_conf
-    need_root "__gui_apply"
-    build_excludes
-    SELECTED=(); SEL_ETC=no
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --etc) etc=yes; shift;;
-            *) [[ -z $id ]] && { id=$1; shift; } || { SELECTED+=("$1"); shift; } ;;
-        esac
-    done
-    [[ -n $id && -f $SNAP_DIR/$id/MANIFEST ]] || die "invalid snapshot: '$id'"
-    (( ${#SELECTED[@]} > 0 || etc == yes )) || die "no items selected"
-    if [[ ${#SELECTED[@]} -gt 0 ]]; then
-        selected_run apply "$SNAP_DIR/$id" "$DEST_HOME"
-    fi
-    if [[ $etc == yes ]] && snap_captured_etc "$SNAP_DIR/$id"; then
-        etc_run apply "$SNAP_DIR/$id/etc" "$DEST_ETC/"
-    fi
-    echo "applied."
 }
 
 
@@ -995,17 +697,15 @@ usage:
   leer snap [--tag MSG] [--quiet]     create a configuration snapshot
   leer list                           list snapshots
   leer diff <id> [<id2>|live]         compare snapshots or vs live system
-  sudo leer restore <id> [--pick]     restore; --pick opens interactive
-                                      file/dir chooser (zenity GUI when in
-                                      a desktop session, numbered menu on TTY)
+  sudo leer restore <id> [--pick]     interactive restore: numbered terminal
+                                      menu lists every captured item, pre-checked
+                                      where it differs from your current system
   sudo leer drop <id> [--yes]         delete one specific snapshot
   sudo leer prune [<keep-n>]          delete oldest snapshots beyond N
   sudo leer schedule set <preset>|--at '<expr>'|off
                                       auto-snapshot timer (hourly..yearly or
                                       any systemd OnCalendar expression)
   leer schedule status                current schedule + next run
-  leer gui                            graphical hub (zenity): snapshot /
-                                      restore / schedule / manage
   leer doctor                         sanity checks
 
 config: $CONF_PATH
@@ -1035,10 +735,6 @@ main() {
         diff)    cmd_diff ${args[@]+"${args[@]}"};;
         restore) cmd_restore ${args[@]+"${args[@]}"};;
         schedule) cmd_schedule ${args[@]+"${args[@]}"};;
-        gui)     cmd_gui ${args[@]+"${args[@]}"};;
-        __gui)   gui_subaction ${args[@]+"${args[@]}"};;
-        __gui_apply) cmd_gui_apply ${args[@]+"${args[@]}"};;
-        __esc)   shift; load_conf; gui_escalate ${args[@]+"${args[@]}"};;
         drop)    cmd_drop ${args[@]+"${args[@]}"};;
         prune)   cmd_prune ${args[@]+"${args[@]}"};;
         doctor)  cmd_doctor;;

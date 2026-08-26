@@ -11,8 +11,7 @@ creates versioned, hardlink-deduplicated snapshots of user configuration
 (\fI~/.config\fR including per-app directories, \fI~/.themes\fR,
 \fI~/.icons\fR, \fI~/.fonts\fR, and top-level dotfiles), plus \fI/etc\fR and
 package/service manifests. Restores are selective: pick exactly which files
-or application directories to roll back via a GUI checklist (zenity) or a
-numbered terminal menu.
+or application directories to roll back via a numbered interactive terminal menu.
 .PP
 leer is fully manual \(en it never runs automatically, never touches pacman
 transactions, and never registers bootloader entries.
@@ -49,10 +48,6 @@ weekly, monthly, yearly; I\-\-atR accepts any systemd OnCalendar
 expression. Scheduled runs are tagged BautoR and obey retention.
 Requires root to change.
 .TP
-.B gui
-Graphical hub (zenity): create snapshot, restore (snapshot dropdown plus
-the interactive file chooser), edit the schedule, drop/prune snapshots,
-run doctor. Root actions elevate via pkexec.
 .TP
 .B doctor
 Verify dependencies, storage, configuration and schedule state.
@@ -67,4 +62,3 @@ MANIFEST, home/, etc/, meta/ (package lists, enabled services).
 0 on success, non-zero on error.
 .SH SEE ALSO
 .BR rsync (1),
-.BR zenity (1)
