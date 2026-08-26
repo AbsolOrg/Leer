@@ -1,0 +1,70 @@
+.TH LEER 8 "2026-08-25" "leer 0.6.0" "User Commands"
+.SH NAME
+leer \- user configuration snapshot & selective restore tool
+.SH SYNOPSIS
+.B leer
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B leer
+creates versioned, hardlink-deduplicated snapshots of user configuration
+(\fI~/.config\fR including per-app directories, \fI~/.themes\fR,
+\fI~/.icons\fR, \fI~/.fonts\fR, and top-level dotfiles), plus \fI/etc\fR and
+package/service manifests. Restores are selective: pick exactly which files
+or application directories to roll back via a GUI checklist (zenity) or a
+numbered terminal menu.
+.PP
+leer is fully manual \(en it never runs automatically, never touches pacman
+transactions, and never registers bootloader entries.
+.SH COMMANDS
+.TP
+.B snap "\fR[\fI\--tag MSG\fR]\fP" "\fR[\fI\--quiet\fR]\fP"
+Create a snapshot. Requires root.
+.TP
+.B list
+List all snapshots with date, tag and size.
+.TP
+.B diff "\fIid1\fR" "\fR[\fBid2|live\fR]\fP"
+Compare two snapshots, or a snapshot against the live system.
+.TP
+.B restore "\fIid\fR" "\fR[\fI\--pick\fR]\fP" "\fR[\fI\--yes\fR]\fP"
+Restore a snapshot. With \fI\--pick\fR an interactive chooser lists every
+captured item (per-app directories under .config, individual dotfiles,
+theme dirs, /etc as one unit). Items differing from the live system are
+pre-checked with change counts; untick anything you want left alone.
+Without a display (TTY/SSH recovery) the same list appears as a numbered
+menu. A dry-run plan is shown before anything is written. Deletions are
+scoped to selected paths only \(em caches, histories and unrelated files
+are never touched. Requires root.
+.TP
+.B drop "\fIid\fR" "\fR[\fI\--yes\fR]\fP"
+Delete one specific snapshot permanently (refuses the last remaining one).
+.TP
+.B prune "\fR[\fIkeep-n\fR]\fP"
+Delete oldest snapshots beyond \fIkeep-n\fR.
+.TP
+.B schedule "RstatusP | set IpresetR | set R\-\-atI exprR | off"
+Manage automatic snapshots via a systemd timer. Presets: hourly, daily,
+weekly, monthly, yearly; I\-\-atR accepts any systemd OnCalendar
+expression. Scheduled runs are tagged BautoR and obey retention.
+Requires root to change.
+.TP
+.B gui
+Graphical hub (zenity): create snapshot, restore (snapshot dropdown plus
+the interactive file chooser), edit the schedule, drop/prune snapshots,
+run doctor. Root actions elevate via pkexec.
+.TP
+.B doctor
+Verify dependencies, storage, configuration and schedule state.
+.SH FILES
+.TP
+.I /etc/leer.conf
+Retention, storage location, home paths, theme-dir toggle, exclude patterns.
+.TP
+.I /var/lib/leer/snapshots/<id>/
+MANIFEST, home/, etc/, meta/ (package lists, enabled services).
+.SH EXIT STATUS
+0 on success, non-zero on error.
+.SH SEE ALSO
+.BR rsync (1),
+.BR zenity (1)

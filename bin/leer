@@ -1,0 +1,1050 @@
+#!/usr/bin/env bash
+# leer - user configuration snapshot & selective restore tool
+# Phase 1: snap / list / diff / restore / prune / doctor
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+VERSION="0.6.2"
+CONF_PATH="${LEER_CONF:-/etc/leer.conf}"
+LEER_BIN="${LEER_BIN:-/usr/local/bin/leer}"      # self-path used in generated units; overridable for tests
+UNIT_DIR="${LEER_UNIT_DIR:-/etc/systemd/system}" # sandbox: point elsewhere to skip systemctl
+
+# Restore targets (overridable only for sandboxed testing)
+DEST_HOME="${LEER_DEST_HOME:-}"
+DEST_ETC="${LEER_DEST_ETC:-/etc}"
+
+MODE=""
+FORCE=no
+QUIET=no
+
+die() { printf 'leer: error: %s\n' "$*" >&2; exit 1; }
+info() { [[ $QUIET == yes ]] || printf '%s\n' "$*"; }
+
+# Real user's home even when run under sudo
+target_home() {
+    local u="${SUDO_USER:-}"
+    if [[ -n $u && $u != root ]]; then
+        getent passwd "$u" | cut -d: -f6
+    else
+        printf '%s' "$HOME"
+    fi
+}
+
+need_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] && return 0
+    # Test-only escape hatch: allowed exclusively when everything is sandboxed in /tmp
+    if [[ ${LEER_SANDBOX:-} == 1 ]]; then
+        [[ $SNAP_DIR == /tmp/* && $DEST_HOME == /tmp/* && $DEST_ETC == /tmp/* ]] \
+            || die "sandbox mode requires SNAP_DIR, DEST_HOME, DEST_ETC under /tmp"
+        return 0
+    fi
+    die "'leer $1' must run as root (sudo leer $1)"
+}
+
+load_conf() {
+    LEER_KEEP=10
+    LEER_MIN_KEEP=3
+    SNAP_DIR="/var/lib/leer/snapshots"
+    HOME_PATHS=(auto)
+    ETC_ENABLE=1
+    GLOBAL_EXCLUDES=(
+        Cache "Code Cache" GPUCache GrShaderCache ShaderCache DawnCache
+        CachedData "Crash Reports" "*.tmp-cfg"
+    )
+    HISTORY_DENY='(^|/)\.[A-Za-z0-9_-]*history$|(^|/)\.(lesshst|viminfo|wget-hsts|netrc|git-credentials|Xauthority|sudo_as_admin_successful)$|(^|/)\.?zcompdump[^/]*$|(^|/)\.[^/]*\.backup[0-9]+$|(^|/)\.[^/]*\.bak$'
+    THEME_DIRS=1
+    TARGET_HOME=""                      # set in conf to pin user home when leer runs as root
+
+    if [[ -n "${LEER_CONF:-}" && ! -r $LEER_CONF ]]; then
+        die "config not readable: $LEER_CONF"
+    fi
+    # shellcheck source=../conf/leer.conf
+    [[ -r $CONF_PATH ]] && source "$CONF_PATH"
+
+    # precedence: LEER_DEST_HOME env > TARGET_HOME from conf > invoking-user auto-detect
+    DEST_HOME=${DEST_HOME:-${TARGET_HOME:-$(target_home)}}
+    case $SNAP_DIR in /*) ;; *) die "SNAP_DIR must be an absolute path (got: $SNAP_DIR)";; esac
+    command -v rsync >/dev/null || die "rsync is required"
+    [[ -d $SNAP_DIR ]] || mkdir -p -- "$SNAP_DIR" 2>/dev/null || die "cannot create $SNAP_DIR"
+}
+
+snapshots() {  # sorted list of snapshot ids (lexicographic ISO ids = chronological)
+    local d
+    for d in "$SNAP_DIR"/*/; do
+        [[ -f ${d}MANIFEST ]] && basename "$d"
+    done
+}
+
+resolve_home_paths() {  # one path per line
+    local f b p
+    if [[ ${HOME_PATHS[*]-} == "auto" ]]; then
+        printf '%s\n' ".config"
+        if [[ ${THEME_DIRS:-1} == 1 ]]; then
+            local td
+            for td in .themes .icons .fonts; do
+                [[ -d $DEST_HOME/$td ]] && printf '%s\n' "$td"
+            done
+        fi
+        while IFS= read -r f; do
+            b=$(basename "$f")
+            [[ $b =~ ${HISTORY_DENY} ]] && continue
+            printf '%s\n' "$b"
+        done < <(find "$DEST_HOME" -mindepth 1 -maxdepth 1 -type f -name '.*' 2>/dev/null | sort)
+    else
+        for p in "${HOME_PATHS[@]}"; do printf '%s\n' "$p"; done
+    fi
+}
+
+build_excludes() {  # fills global array EXCL_ARGS
+    EXCL_ARGS=()
+    local e
+    for e in ${GLOBAL_EXCLUDES[@]+"${GLOBAL_EXCLUDES[@]}"}; do
+        EXCL_ARGS+=(--exclude="$e")
+    done
+}
+
+# Sync home paths between $2 (snapshot tree root) and $3 (live home).
+#   mode=dry   -> itemized preview on stdout
+#   mode=apply -> copy/delete for real
+# The snapshot is always the SENDER. Deletions are scoped per captured path
+# and excludes are re-applied, so caches/history/unrelated files can never
+# be touched by --delete.
+home_run() {
+    local mode=$1 snap_root=$2 live_home=$3
+    local p act=()
+    case $mode in
+        dry)   act=(--itemize-changes --dry-run);;
+        apply) act=(--archive --xattrs --hardlinks);;
+    esac
+    while IFS= read -r p; do
+        [[ -n $p ]] || continue
+        if [[ $mode == dry ]]; then
+            ( cd "$snap_root/home" && exec rsync -ain --delete \
+                ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} -R "./${p#/}" "$live_home/" ) || true
+        else
+            ( cd "$snap_root/home" && exec rsync -aXH --delete \
+                ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} -R "./${p#/}" "$live_home/" )
+        fi
+    done < <(snapshot_paths "$snap_root")
+}
+
+snapshot_paths() {  # re-reads captured path list from a snapshot's MANIFEST
+    sed -n 's/^HOME_PATHS=//p' "$1/MANIFEST" | tr ' ' '\n'
+}
+
+snap_captured_etc() {  # true only when the snapshot really contains /etc data
+    grep -q '^ETC_CAPTURED=yes' "$1/MANIFEST" && [[ -n $(ls -A "$1/etc" 2>/dev/null) ]]
+}
+
+# Capture-grade rsync: tolerates partial transfers (unreadable files),
+# fails hard on real errors.
+LEER_SKIP_LOG=""
+
+rsync_capture() {  # partial transfers tolerated; skips collected into LEER_SKIP_LOG
+    local out rc=0
+    out=$(rsync "$@" 2>&1) || rc=$?
+    (( rc == 0 )) && return 0
+    if (( rc == 23 || rc == 24 )); then
+        if [[ -n $LEER_SKIP_LOG ]]; then
+            printf '%s\n' "$out" | grep 'failed\|denied' >>"$LEER_SKIP_LOG" || true
+        fi
+        return 0
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+}
+
+# Remove abandoned partial snapshots (crashed runs leave no MANIFEST)
+janitor() {
+    local d now
+    now=$(date +%s)
+    for d in "$SNAP_DIR"/*/; do
+        [[ -f ${d}MANIFEST ]] && continue
+        (( now > $(date +%s -r "${d%/}") + 900 )) || continue
+        rm -rf -- "${d%/}"
+        info "removed partial snapshot: ${d%/}"
+    done
+}
+
+etc_run() {
+    local mode=$1 snap_etc=$2 live_etc=$3
+    local act=()
+    case $mode in
+        dry)   act=(-ain);;
+        apply) act=(-aXH);;
+    esac
+    rsync "${act[@]}" --delete ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} "$snap_etc/" "$live_etc/"
+}
+
+cmd_snap() {
+    local tag="" quiet=$QUIET
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --tag) tag=${2-}; shift 2;;
+            --quiet|-q) quiet=yes; shift;;
+            *) die "snap: unknown option '$1'";;
+        esac
+    done
+
+    load_conf
+    need_root snap
+    janitor || true
+    LEER_SKIP_LOG=$(mktemp); export LEER_SKIP_LOG
+
+    local id dest prev="" s count=0 p hp_list=""
+    id=$(date +%Y-%m-%dT%H%M%S)
+    dest="$SNAP_DIR/$id"
+    [[ -e $dest ]] && die "snapshot id collision: $id"
+
+    for s in $(snapshots); do prev=$s; done
+
+    mkdir -p -- "$dest/home" "$dest/etc" "$dest/meta"
+
+    mapfile -t hp < <(resolve_home_paths)
+    build_excludes
+
+    local ld_home=() ld_etc=()
+    [[ -n $prev && -d $SNAP_DIR/$prev/home ]] && ld_home=(--link-dest="$SNAP_DIR/$prev/home/")
+    [[ -n $prev && -d $SNAP_DIR/$prev/etc  ]] && ld_etc=(--link-dest="$SNAP_DIR/$prev/etc/")
+
+    for p in "${hp[@]}"; do
+        src="$DEST_HOME/${p#/}"
+        [[ -e $src ]] || continue
+        ( cd "$DEST_HOME" && rsync_capture -aXH ${ld_home[@]+"${ld_home[@]}"} \
+            ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} -R "./${p#/}" "$dest/home/" )
+        count=$((count + 1))
+        hp_list="$hp_list ${p#/}"
+    done
+
+    local etc_done=no
+    if (( ETC_ENABLE )); then
+        rsync_capture -aXH ${ld_etc[@]+"${ld_etc[@]}"} ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} /etc/ "$dest/etc/"
+        etc_done=yes
+    fi
+
+    pacman -Qqe >"$dest/meta/packages-explicit.txt" 2>/dev/null || : >"$dest/meta/packages-explicit.txt"
+    pacman -Qqm >"$dest/meta/packages-foreign.txt" 2>/dev/null || : >"$dest/meta/packages-foreign.txt"
+    systemctl list-unit-files --state=enabled --no-legend --no-pager \
+        >"$dest/meta/services-enabled.txt" 2>/dev/null || : >"$dest/meta/services-enabled.txt"
+    {
+        printf 'kernel=%s\n' "$(uname -r)"
+        if [[ -d /boot/grub ]]; then printf 'bootloader=grub\n'
+        elif command -v bootctl >/dev/null && bootctl status &>/dev/null; then printf 'bootloader=systemd-boot\n'
+        else printf 'bootloader=unknown\n'; fi
+    } >"$dest/meta/boot-info.txt"
+
+    cat >"$dest/MANIFEST" <<EOF
+ID=$id
+DATE_ISO=$(date +%Y-%m-%dT%H:%M:%S%z)
+TAG=$tag
+HOSTNAME=$(hostname)
+KERNEL=$(uname -r)
+PARENT=${prev:-none}
+HOME_PATHS=${hp_list# }
+ETC_CAPTURED=$etc_done
+PKGS_EXPLICIT=$(wc -l <"$dest/meta/packages-explicit.txt")
+PKGS_FOREIGN=$(wc -l <"$dest/meta/packages-foreign.txt")
+LEER_VERSION=$VERSION
+EOF
+
+    if [[ -s $LEER_SKIP_LOG ]]; then
+        local nsk
+        nsk=$(sort -u "$LEER_SKIP_LOG" | wc -l)
+        info "warning: $nsk file(s) skipped during capture (permissions/vanished):"
+        sort -u "$LEER_SKIP_LOG" | head -8 | while IFS= read -r l; do info "  $l"; done
+        (( nsk > 8 )) && info "  ... and $((nsk - 8)) more"
+    fi
+    rm -f -- "$LEER_SKIP_LOG"; unset LEER_SKIP_LOG
+
+    local pruned_n
+    pruned_n=$(prune_keep "$LEER_KEEP")
+    if (( pruned_n > 0 )) && [[ $quiet != yes ]]; then
+        info "auto-pruned $pruned_n old snapshot(s) (keep=$LEER_KEEP)"
+    fi
+
+    [[ $quiet == yes ]] && return 0
+    info "snapshot: $id"
+    info "  home entries : $count (${hp_list# })"
+    info "  /etc         : $etc_done"
+    info "  parent       : ${prev:-none (full copy)}"
+    info "  size         : $(du -sh "$dest" 2>/dev/null | cut -f1)"
+}
+
+cmd_list() {
+    load_conf
+    local s d t tag size n=0
+    printf '%-21s %-17s %-24s %s\n' "ID" "DATE" "TAG" "SIZE"
+    while IFS= read -r s; do
+        d=${s%%T*}; t=${s#*T}
+        tag=$(sed -n 's/^TAG=//p' "$SNAP_DIR/$s/MANIFEST")
+        size=$(du -sh "$SNAP_DIR/$s" 2>/dev/null | cut -f1)
+        printf '%-21s %-17s %-24s %s\n' "$s" "$d $t" "${tag:--}" "$size"
+        n=$((n + 1))
+    done < <(snapshots)
+    (( n == 0 )) && info "no snapshots yet — run: sudo leer snap"
+    return 0
+}
+
+cmd_diff() {
+    [[ $# -ge 1 ]] || die "usage: leer diff <id> [<id2>|live]"
+    load_conf
+    build_excludes
+
+    local a="$SNAP_DIR/$1"
+    [[ -f $a/MANIFEST ]] || die "no such snapshot: $1"
+
+    local b_label="live" b_home="" b_etc="$DEST_ETC/"
+    if [[ $# -ge 2 && $2 != live ]]; then
+        local b="$SNAP_DIR/$2"
+        [[ -f $b/MANIFEST ]] || die "no such snapshot: $2"
+        b_label=$2; b_home="$b/home/"; b_etc="$b/etc/"
+    fi
+
+    local tmp total dels label_src="$1"
+    if [[ -d $a/home ]]; then
+        tmp=$(mktemp)
+        home_run dry "$a" "${b_home:-$DEST_HOME}" >"$tmp" || true
+        total=$(grep -c . "$tmp" || true); dels=$(grep -c '^\*deleting' "$tmp" || true)
+        printf '== home (%s -> %s): %d change(s), %d deletion(s)\n' "$label_src" "$b_label" "$total" "$dels"
+        if (( total > 0 )); then
+            head -n 100 "$tmp"
+            (( total > 100 )) && printf '... (%d more)\n' "$((total - 100))"
+        fi
+        rm -f "$tmp"
+    fi
+    if [[ -d $a/etc ]] && snap_captured_etc "$a"; then
+        tmp=$(mktemp)
+        etc_run dry "$a/etc" "${b_etc%/}/" >"$tmp" || true
+        total=$(grep -c . "$tmp" || true); dels=$(grep -c '^\*deleting' "$tmp" || true)
+        printf '== etc  (%s -> %s): %d change(s), %d deletion(s)\n' "$label_src" "$b_label" "$total" "$dels"
+        if (( total > 0 )); then
+            head -n 100 "$tmp"
+            (( total > 100 )) && printf '... (%d more)\n' "$((total - 100))"
+        fi
+        rm -f "$tmp"
+    fi
+}
+
+cmd_restore() {
+    local id="" apply=no PICK=no
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --yes|-y) apply=yes; shift;;
+            --pick|-p) PICK=yes; shift;;
+            -h|--help) printf 'usage: sudo leer restore <id> [--pick] [--yes]\n'; exit 0;;
+            *) [[ -z $id ]] || die "restore: unexpected argument '$1'"; id=$1; shift;;
+        esac
+    done
+    [[ -n $id ]] || die "usage: sudo leer restore <id> [--pick] [--yes]"
+    SELECTED=(); SEL_ETC=no
+    load_conf
+    need_root restore
+    build_excludes
+
+    local snap="$SNAP_DIR/$id"
+    [[ -f $snap/MANIFEST ]] || die "no such snapshot: $id"
+    info "restoring snapshot: $id ($(sed -n 's/^DATE_ISO=//p' "$snap/MANIFEST"))"
+
+    if [[ $PICK == yes ]]; then
+        pick_items "$snap" || { info "nothing selected — aborted."; return 0; }
+        info "selected: ${SELECTED[*]:-}$([[ $SEL_ETC == yes ]] && echo ' <etc>')"
+        [[ -n ${SELECTED[*]:-} || $SEL_ETC == yes ]] || { info "nothing selected."; return 0; }
+    fi
+
+    local plan tmp total dels chgs=0
+    plan=$(mktemp)
+    trap "rm -f '$plan'" EXIT
+
+    if [[ -d $snap/home ]]; then
+        tmp=$(mktemp)
+        if [[ $PICK == yes ]]; then selected_run dry "$snap" "$DEST_HOME" >"$tmp" || true
+        else home_run dry "$snap" "$DEST_HOME" >"$tmp" || true; fi
+        total=$(grep -c . "$tmp" || true); dels=$(grep -c '^\*deleting' "$tmp" || true)
+        printf '[home] %d change(s), %d deletion(s)\n' "$total" "$dels" >>"$plan"
+        head -n 60 "$tmp" >>"$plan"
+        chgs=$((chgs + total)); rm -f "$tmp"
+    else
+        printf '[home] nothing captured\n' >>"$plan"
+    fi
+    if [[ -d $snap/etc ]] && snap_captured_etc "$snap" \
+       && { [[ $PICK != yes || $SEL_ETC == yes ]]; }; then
+        tmp=$(mktemp); etc_run dry "$snap/etc" "$DEST_ETC/" >"$tmp" || true
+        total=$(grep -c . "$tmp" || true); dels=$(grep -c '^\*deleting' "$tmp" || true)
+        printf '[etc] %d change(s), %d deletion(s)\n' "$total" "$dels" >>"$plan"
+        head -n 60 "$tmp" >>"$plan"
+        chgs=$((chgs + total)); rm -f "$tmp"
+    else
+        printf '[etc] nothing captured\n' >>"$plan"
+    fi
+
+    cat "$plan"
+
+    local missing extra
+    missing=$(comm -23 <(sort -u "$snap/meta/packages-explicit.txt") <(pacman -Qqe 2>/dev/null | sort -u) || true)
+    extra=$(comm -13 <(sort -u "$snap/meta/packages-explicit.txt") <(pacman -Qqe 2>/dev/null | sort -u) || true)
+    [[ -n $missing ]] && printf 'packages in snapshot but NOT installed now:\n%s\n' "$missing"
+    [[ -n $extra ]] && printf 'packages installed now but NOT in snapshot:\n%s\n' "$extra"
+
+    if [[ $chgs -eq 0 ]]; then
+        info "nothing to do — live system already matches this snapshot."
+        return 0
+    fi
+
+    if [[ $apply != yes && $FORCE != yes ]]; then
+        read -r -p "Apply this restore? Type 'yes' to continue: " ans
+        [[ $ans == yes ]] || { info "aborted."; return 0; }
+    fi
+
+    if [[ -d $snap/home ]]; then
+        if [[ $PICK == yes ]]; then selected_run apply "$snap" "$DEST_HOME"
+        else home_run apply "$snap" "$DEST_HOME"; fi
+    fi
+    if [[ -d $snap/etc ]] && snap_captured_etc "$snap" \
+       && { [[ $PICK != yes || $SEL_ETC == yes ]]; }; then
+        etc_run apply "$snap/etc" "$DEST_ETC/"
+    fi
+
+    info "restore complete."
+    info "note: re-login / restart your session to pick up restored configs."
+    [[ -n $missing ]] && info "note: consider reinstalling packages listed above."
+    return 0
+}
+
+# Deletes oldest snapshots beyond $1; prints removed count to stdout.
+prune_keep() {
+    local keep=$1 all=() i total s n=0
+    mapfile -t all < <(snapshots)
+    total=${#all[@]}
+    (( total > keep )) || { printf 0; return 0; }
+    for (( i=0; i<total-keep; i++ )); do
+        s=${all[i]}
+        case $s in ''|.|..|*/*) die "unsafe snapshot id encountered: '$s'";; esac
+        rm -rf -- "${SNAP_DIR:?}/$s"
+        printf 'leer: pruned: %s\n' "$s" >&2
+        n=$((n + 1))
+    done
+    printf '%d' "$n"
+}
+
+cmd_prune() {
+    local keep="${1:-}"
+    load_conf
+    need_root prune
+    [[ $keep =~ ^[0-9]+$ ]] || keep=$LEER_KEEP
+    (( keep >= LEER_MIN_KEEP )) || die "refusing to keep fewer than $LEER_MIN_KEEP snapshots"
+    local n
+    n=$(prune_keep "$keep")
+    if (( n == 0 )); then
+        local total
+        total=$(snapshots | wc -l)
+        info "nothing to prune ($total snapshot(s), keeping $keep)."
+    else
+        info "kept newest $keep snapshot(s)."
+    fi
+}
+
+# ------------------------- schedule (systemd timer) -------------------------
+
+sched_preset_valid() {
+    case $1 in hourly|daily|weekly|monthly|yearly) return 0;; esac
+    return 1
+}
+
+sched_write_units() {  # $1=OnCalendar expression $2=tag
+    mkdir -p -- "$UNIT_DIR"
+    cat > "$UNIT_DIR/leer-snapshot.service" <<UNIT
+[Unit]
+Description=leer: scheduled configuration snapshot
+
+[Service]
+Type=oneshot
+ExecStart=${LEER_BIN} snap --quiet --tag ${2}
+UNIT
+    cat > "$UNIT_DIR/leer-snapshot.timer" <<UNIT
+[Unit]
+Description=leer: scheduled configuration snapshot timer
+
+[Timer]
+OnCalendar=${1}
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+sched_real() { [[ -z ${LEER_UNIT_DIR:-} ]]; }
+
+cmd_schedule() {
+    local sub="${1:-status}"
+    shift || true
+    load_conf
+
+    case $sub in
+        status)
+            if [[ -f $UNIT_DIR/leer-snapshot.timer ]]; then
+                printf 'schedule : %s\n' "$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer")"
+                if sched_real && systemctl is-enabled leer-snapshot.timer &>/dev/null; then
+                    printf 'enabled  : yes\n'
+                    systemctl list-timers leer-snapshot.timer --no-pager 2>/dev/null \
+                        | awk 'NR==2{print "next run :", $1, $2}'
+                elif sched_real; then
+                    printf 'enabled  : no (units present but timer disabled)\n'
+                else
+                    printf '(sandbox: systemctl state not queried)\n'
+                fi
+            else
+                printf 'schedule : off\n'
+            fi
+            ;;
+        set)
+            local cal="" at=no a
+            while [[ $# -gt 0 ]]; do
+                a=$1
+                if [[ $a == --at ]]; then at=yes
+                elif [[ -z $cal ]]; then cal=$a
+                fi
+                shift
+            done
+            [[ -n $cal ]] || die "usage: leer schedule set <hourly|daily|weekly|monthly|yearly> | set --at '<OnCalendar expr>'"
+            if [[ $at == no ]] && ! sched_preset_valid "$cal"; then
+                die "unknown preset '$cal' — use hourly|daily|weekly|monthly|yearly, or set --at '<expr>'"
+            fi
+            need_root "schedule set"
+            if command -v systemd-analyze >/dev/null; then
+                systemd-analyze calendar "$cal" >/dev/null 2>&1 \
+                    || die "invalid calendar expression: '$cal' (test with: systemd-analyze calendar \"$cal\")"
+            fi
+            sched_write_units "$cal" auto
+            if sched_real; then
+                systemctl daemon-reload
+                systemctl enable --now leer-snapshot.timer >/dev/null
+                info "scheduled: $cal — enabled"
+                systemd-analyze calendar "$cal" 2>/dev/null | grep -m1 'Next elapse' || true
+            else
+                info "(sandbox) units written under $UNIT_DIR; systemctl skipped"
+            fi
+            ;;
+        off)
+            need_root "schedule off"
+            if sched_real; then
+                systemctl disable --now leer-snapshot.timer >/dev/null 2>&1 || true
+                systemctl daemon-reload 2>/dev/null || true
+            fi
+            rm -f -- "$UNIT_DIR/leer-snapshot.service" "$UNIT_DIR/leer-snapshot.timer"
+            info "schedule removed."
+            ;;
+        *) die "usage: leer schedule [status | set <preset> | set --at '<expr>' | off]" ;;
+    esac
+}
+
+# ------------------------- GUI hub -------------------------
+
+gui_ask() {  # pops next scripted answer from $ZENITY_SCRIPT_FILE when testing
+    if [[ -n ${ZENITY_SCRIPT_FILE:-} ]]; then
+        local line rest
+        IFS= read -r line < "$ZENITY_SCRIPT_FILE" || return 1
+        rest=$(tail -n +2 "$ZENITY_SCRIPT_FILE")
+        printf '%s\n' "$rest" > "$ZENITY_SCRIPT_FILE"
+        [[ -n $line && $line != SKIP ]] || return 1
+        printf '%s\n' "$line"
+        return 0
+    fi
+    zenity "$@" 2>/dev/null
+}
+
+gui_escalate() {  # run remaining args as root: pkexec -> zenity-password sudo -> guidance
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then "$@"; return $?; fi
+    local bin out rc=0 pw
+    bin=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || bin="$LEER_BIN"
+    [[ -x $bin ]] || { zenity --error --text="leer binary not found" 2>/dev/null; return 1; }
+    [[ ${1:-} == leer ]] && shift      # tolerate legacy "leer cmd…" style callers
+
+    if command -v pkexec >/dev/null; then
+        out=$(pkexec "$bin" "$@" 2>&1) && return 0
+        # failure often = no polkit agent on WMs (Hyprland etc.); fall through to sudo
+    fi
+
+    pw=$(zenity --password --title="leer needs administrator rights" \
+         2>/dev/null) || {
+        zenity --error --title="leer" \
+            --text="Authentication cancelled.\nManual equivalent:\n  sudo $(basename "$bin") $*" 2>/dev/null
+        return 1
+    }
+    out=$(printf '%s\n' "$pw" | sudo -S -p '' "$bin" "$@" 2>&1) || rc=$?
+    unset pw
+    (( rc == 0 )) && return 0
+    zenity --error --title="leer" \
+        --text="Action failed:\n${out##*$'\n'}\n\nManual equivalent:\n  sudo $(basename "$bin") $*" 2>/dev/null
+    return $rc
+}
+
+gui_snap() {
+    local out rc=0
+    out=$(gui_escalate leer snap --tag gui 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        gui_ask --info --title="leer" --text="Snapshot created." >/dev/null
+        return 0
+    fi
+    gui_ask --error --title="leer" --text="Snapshot failed:\n${out##*$'\n'}" >/dev/null
+    return $rc
+}
+
+gui_restore() {
+    local ids=() rows=() s id tag date pick plan rc=0
+    while IFS= read -r s; do
+        id=$s
+        tag=$(sed -n 's/^TAG=//p' "$SNAP_DIR/$s/MANIFEST")
+        date=$(sed -n 's/^DATE_ISO=//p' "$SNAP_DIR/$s/MANIFEST")
+        rows+=("$id" "${date%%+*}" "${tag:--}")
+    done < <(snapshots)
+    (( ${#rows[@]} )) || { gui_ask --info --text="No snapshots yet." >/dev/null; return 0; }
+    id=$(gui_ask --list --radiolist --title="leer restore" \
+            --column "" --column "ID" --column "Date" --column "Tag" \
+            "${rows[@]}" --width=700 --height=420) || return 0
+    [[ -n $id ]] || return 0
+
+    SELECTED=(); SEL_ETC=no
+    pick_items "$SNAP_DIR/$id" || { gui_ask --info --text="Nothing selected." >/dev/null; return 0; }
+    build_excludes
+    plan=$(mktemp)
+    selected_run dry "$SNAP_DIR/$id" "$DEST_HOME" >"$plan" 2>/dev/null || true
+    { echo "Selected: ${SELECTED[*]:-}$([[ $SEL_ETC == yes ]] && echo ' <etc>')"
+      echo; head -60 "$plan"; } >"$plan.f"
+    mv "$plan.f" "$plan"
+    gui_ask --question --title="Apply restore?" --width=520 \
+           --text="$(head -c 1500 "$plan")
+
+Write these changes to your live system?" >/dev/null || { rm -f "$plan"; return 0; }
+    rm -f "$plan"
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        selected_run apply "$SNAP_DIR/$id" "$DEST_HOME"
+        if [[ $SEL_ETC == yes ]] && snap_captured_etc "$SNAP_DIR/$id"; then
+            etc_run apply "$SNAP_DIR/$id/etc" "$DEST_ETC/"
+        fi
+    else
+        local esc=(__gui_apply "$id")
+        [[ $SEL_ETC == yes ]] && esc+=(--etc)
+        esc+=(${SELECTED[@]+"${SELECTED[@]}"})
+        if ! out=$(gui_escalate "${esc[@]}" 2>&1); then
+            gui_ask --error --title="leer" --text="Restore failed:\n${out##*$'\n'}" >/dev/null
+            return 1
+        fi
+    fi
+    gui_ask --info --text="Restore complete.\nRe-login / restart your session." >/dev/null
+}
+
+gui_schedule() {
+    local cur cal choice custom
+    cur=$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer" 2>/dev/null || true)
+    choice=$(gui_ask --list --radiolist --title="leer schedule" \
+        --text="Current: ${cur:-off}" \
+        --column "" --column "Preset" \
+        FALSE Off FALSE Hourly FALSE Daily FALSE Weekly FALSE Monthly FALSE Yearly FALSE "Custom…" \
+        --width=440 --height=360) || { return 0; }
+    case $choice in
+        "") return 0;;
+        Off) gui_escalate leer schedule off; return 0;;
+        Custom…)
+            custom=$(gui_ask --entry --title="Custom OnCalendar" \
+                     --text="systemd calendar expression\ne.g. Mon..Fri 09:00 or 2026-*-01 04:00" \
+                     --entry-text="${cur:-daily}") || return 0
+            [[ -n $custom ]] || return 0
+            gui_escalate leer schedule set --at "$custom"; return 0;;
+        Hourly) cal=hourly;; Daily) cal=daily;; Weekly) cal=weekly;;
+        Monthly) cal=monthly;; Yearly) cal=yearly;;
+    esac
+    gui_escalate leer schedule set "$cal"
+}
+
+gui_manage() {
+    local act id n
+    act=$(gui_ask --list --title="Manage snapshots" --column "Action" \
+            "Drop a snapshot…" "Prune (keep newest N)…" "Back" \
+            --height=240 --width=380) || return 0
+    case $act in
+        "Drop a snapshot…"*)
+            id=$(gui_ask --list --radiolist --title="Drop snapshot" \
+                 --column "" --column ID --column Tag \
+                 $(
+                   while IFS= read -r s; do
+                       printf '%s %s %q ' FALSE "$s" "$(sed -n 's/^TAG=//p' "$SNAP_DIR/$s/MANIFEST")"
+                   done < <(snapshots)
+                 ) --width=560 --height=400) || return 0
+            [[ -n $id ]] || return 0
+            gui_ask --question --title="Confirm drop" \
+                    --text="Permanently delete snapshot $id?" >/dev/null \
+                && gui_escalate leer drop "$id" --yes
+            ;;
+        "Prune"*)
+            n=$(gui_ask --entry --title="Prune" --text="Keep newest N snapshots:" \
+                --entry-text="${LEER_KEEP}") || return 0
+            [[ $n =~ ^[0-9]+$ ]] && gui_escalate leer prune "$n"
+            ;;
+    esac
+}
+
+classic_hub() {
+    load_conf
+    command -v zenity >/dev/null || die "GUI requires zenity (pacman -S zenity)"
+    local choice
+    while :; do
+        choice=$(zenity --list --title="leer v$VERSION" \
+            --column "Action" \
+            "Create snapshot now" "Restore…" "Schedule…" "Manage snapshots…" "Doctor" "Quit" \
+            --width=430 --height=330 2>/dev/null) || exit 0
+        case $choice in
+            "Create snapshot now") gui_snap ;;
+            Restore*)              gui_restore ;;
+            Schedule*)             gui_schedule ;;
+            Manage* )              gui_manage ;;
+            Doctor)                cmd_doctor | gui_ask --text-info --title="leer doctor" \
+                                            --width=620 --height=420 --font=monospace >/dev/null ;;
+            *)                     exit 0 ;;
+        esac
+    done
+}
+
+cmd_doctor() {
+    load_conf
+    local fail=0
+    chk() {
+        local desc=$1; shift
+        if "$@" >/dev/null 2>&1; then
+            printf '  [ok]   %s\n' "$desc"
+        else
+            printf '  [FAIL] %s\n' "$desc"
+            fail=$((fail + 1))
+        fi
+    }
+    info "leer doctor v$VERSION"
+    chk "rsync available"     rsync --version
+    chk "pacman available"    pacman -Q
+    if command -v zenity >/dev/null; then
+        printf '  [ok]   zenity available (GUI file picker)\n'
+    else
+        printf '  [--]   zenity not found — GUI picker unavailable (numbered TTY picker always works)\n'
+    fi
+    chk "snapshot dir usable" test -w "$SNAP_DIR"
+    chk "config loaded"       test -n "${LEER_KEEP:-}"
+
+    local n=0 s
+    for s in $(snapshots); do n=$((n + 1)); done
+    if (( n > 0 )); then
+        printf '  [ok]   %d snapshot(s) present\n' "$n"
+    else
+        printf '  [--]   no snapshots yet (run: sudo leer snap)\n'
+    fi
+
+    if [[ -f $UNIT_DIR/leer-snapshot.timer ]]; then
+        printf '  [ok]   schedule installed (%s)\n' \
+            "$(sed -n 's/^OnCalendar=//p' "$UNIT_DIR/leer-snapshot.timer")"
+    else
+        printf '  [--]   no schedule configured (optional: leer gui > Schedule)\n'
+    fi
+
+    if (( fail > 0 )); then
+        die "doctor found $fail failing check(s)"
+    fi
+}
+
+# ------------------------- selective restore (picker) -------------------------
+
+SELECTED=()      # chosen home-relative items; dirs carry trailing slash
+TTY_ITEMS=()     # selections coming from the TTY numbered picker
+SEL_ETC=no
+
+inventory_items() {  # $1=snapshot root -> "relpath<TAB>kind" lines
+    local p sub name
+    while IFS= read -r p; do
+        [[ -n $p ]] || continue
+        src="$1/home/$p"
+        [[ -e $src ]] || continue
+        if [[ $p == ".config" && -d $src ]]; then
+            while IFS= read -r sub; do
+                name=".config/${sub##*/}"
+                [[ -d $sub ]] && printf '%s/\tdir\n' "$name" || printf '%s\tfile\n' "$name"
+            done < <(find "$src" -mindepth 1 -maxdepth 1 | sort)
+        elif [[ -d $src ]]; then
+            printf '%s/\tdir\n' "$p"
+        else
+            printf '%s\tfile\n' "$p"
+        fi
+    done < <(snapshot_paths "$1")
+    snap_captured_etc "$1" && printf 'etc\tunit\n'
+    return 0
+}
+
+change_map() {  # $1=snap_root $2=outfile : one changed relpath per line
+    local out
+    out=$(home_run dry "$1" "$DEST_HOME" 2>/dev/null || true)
+    {
+        printf '%s\n' "$out" | sed -n 's/^\*deleting //p'
+        printf '%s\n' "$out" | grep '^[-<>ch.]' \
+            | sed -e '/^$/d' -e '/^skipping/d' -e 's/ -> .*//' | cut -c13-
+    } >>"$2" || true
+}
+
+item_changed() {  # $1=changes-file $2=item -> "Mm/Dd" summary or "-"
+    local item=$2 bare=${2%/} total dels m
+    total=$(grep -c "^${bare}\(/\|$\)" "$1" || true)
+    dels=$(grep "^\*deleting ${bare}\(/\|$\)" "$1" 2>/dev/null | wc -l)
+    if (( total > 0 )); then printf '%dm/%dd' "$((total - dels))" "$dels"; else printf -- '-'; fi
+}
+
+build_rows() {  # $1=inv-file -> prints "STATE path summary" triples for zenity checklists
+    local item kind state summary
+    while IFS=$'\t' read -r item kind; do
+        summary=$(item_changed "$1" "$item")
+        [[ $summary == '-' ]] && state=FALSE || state=TRUE
+        printf '%s %q %s ' "$state" "${item%/}" "$summary"
+    done <"$1"
+}
+
+is_dir_item() {  # $1=inv-file $2=item (no trailing slash) -> 0 if captured as directory
+    grep -q "^${2}/	" "$1" 2>/dev/null
+}
+
+tty_pick() {  # $1=inv-file ; fills TTY_ITEMS[] (+SEL_ETC) from numbered menu on stdin
+    TTY_ITEMS=()
+    local item kind state summary i=0 n ans
+    local lines=()
+    echo "TTY picker — enter numbers (space-separated), a=all, Enter=abort:"
+    while IFS=$'\t' read -r item kind; do
+        summary=$(item_changed "$1" "$item")
+        state="-"; [[ $summary != '-' ]] && state="x"
+        i=$((i + 1)); lines+=("$item")
+        printf '  %2d [%s] %-40s %s\n' "$i" "$state" "${item%/}" "$summary"
+    done <"$1"
+    (( i > 0 )) || { info "nothing captured."; return 1; }
+    read -r -p "selection: " ans
+    [[ -z ${ans:-} || $ans == q* ]] && return 1
+    [[ $ans == a ]] && ans=$(seq 1 "$i")
+    for n in $ans; do
+        [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= i )) || continue
+        item=${lines[n-1]}
+        case $item in
+            etc) SEL_ETC=yes ;;
+            *)   is_dir_item "$1" "${item%/}" && TTY_ITEMS+=("${item}/") || TTY_ITEMS+=("$item") ;;
+        esac
+    done
+    (( ${#TTY_ITEMS[@]} > 0 || $SEL_ETC == yes )) || return 1
+    return 0
+}
+
+pick_items() {  # $1=snap root ; fills SELECTED[] + SEL_ETC ; rc 0=selection made
+    local inv changes item kind state summary sel
+    inv=$(mktemp); changes=$(mktemp)
+    inventory_items "$1" >"$inv"
+    : >"$changes"
+    change_map "$1" "$changes"
+
+    # --- build dialog selection source: scripted queue / zenity / TTY ---
+    if [[ -n ${ZENITY_SCRIPT_FILE:-} ]]; then
+        sel=$(gui_ask --list --checklist --title="leer restore $(basename "$1")" \
+                --text="Pre-checked = differs from your current system." \
+                --column "" --column "Path" --column "Changes" \
+                $(build_rows "$inv")) || return 1
+    elif command -v zenity >/dev/null && [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]; then
+        sel=$(zenity --list --checklist --title="leer restore $(basename "$1")" \
+                --text="Pre-checked = differs from your current system.\nTick what to restore." \
+                --column "" --column "Path" --column "Changes" \
+                $(build_rows "$inv") --width=760 --height=620 2>/dev/null) || return 1
+    else
+        tty_pick "$inv"; rc=$?
+        (( rc == 0 )) || return $rc
+    fi
+
+    [[ -n ${sel:-} || -n ${TTY_ITEMS[*]:-} ]] || return 1
+
+    if (( ${#TTY_ITEMS[@]} > 0 )); then
+        SELECTED=("${TTY_ITEMS[@]}")
+    else
+        while IFS= read -r item; do
+            [[ -n $item ]] || continue
+            case $item in
+                etc) SEL_ETC=yes ;;
+                *)   is_dir_item "$inv" "$item" && SELECTED+=("${item}/") || SELECTED+=("$item") ;;
+            esac
+        done < <(printf '%s\n' "$sel" | tr '|' '\n')
+    fi
+    rm -f "$inv" "$changes"
+    [[ ${#SELECTED[@]} -gt 0 || $SEL_ETC == yes ]]
+}
+
+match_selected() {  # $1=captured path -> 0 if covered by current selection
+    local s
+    for s in ${SELECTED[@]+"${SELECTED[@]}"}; do
+        [[ $1 == "${s%/}" || $1 == "${s%/}/"* ]] && return 0
+    done
+    return 1
+}
+
+# Transfer exactly the user-selected items (snapshot tree is the sender).
+selected_run() {  # mode=snapshot-root live-home
+    local mode=$1 snap_root=$2 live_home=$3
+    local s act=() bare
+    case $mode in
+        dry)   act=(-ain);;
+        apply) act=(-aXH);;
+    esac
+    for s in ${SELECTED[@]+"${SELECTED[@]}"}; do
+        bare="${s%/}"
+        [[ -e $snap_root/home/$bare ]] || continue
+        ( cd "$snap_root/home" && exec rsync ${act[@]+"${act[@]}"} --delete \
+            ${EXCL_ARGS[@]+"${EXCL_ARGS[@]}"} -R "./$bare" "$live_home/" )
+    done
+}
+
+cmd_drop() {
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --yes|-y) FORCE=yes; shift;;
+            -h|--help) printf 'usage: sudo leer drop <id> [--yes]\n'; exit 0;;
+            *) [[ -z $id ]] || die "drop: unexpected argument '$1'"; id=$1; shift;;
+        esac
+    done
+    [[ -n $id ]] || die "usage: sudo leer drop <id> [--yes]"
+    case $id in ''|.|..|*/*) die "unsafe snapshot id: '$id'";; esac
+    load_conf
+    need_root drop
+    [[ -f $SNAP_DIR/$id/MANIFEST ]] || die "no such snapshot: $id"
+    local total
+    total=$(snapshots | wc -l)
+    (( total > 1 )) || die "refusing to drop the only remaining snapshot"
+    if [[ $FORCE != yes ]]; then
+        read -r -p "Permanently delete snapshot '$id'? Type 'yes': " ans
+        [[ $ans == yes ]] || { info "aborted."; return 0; }
+    fi
+    rm -rf -- "${SNAP_DIR:?}/$id"
+    info "dropped: $id"
+}
+
+
+# ------------------------- persistent tray GUI (yad) -------------------------
+
+GUI_SELF=""   # resolved at runtime; menu items re-enter leer as hidden subactions
+
+gui_tray_menu_string() {
+    printf 'Snapshot now!%s __gui snap|Restore…!%s __gui restore|Schedule…!%s __gui schedule|Manage…!%s __gui manage|Doctor!%s __gui doctor|Quit!quit' \
+        "$GUI_SELF" "$GUI_SELF" "$GUI_SELF" "$GUI_SELF" "$GUI_SELF"
+}
+
+gui_subaction() {  # entry point used by tray menu items
+    load_conf
+    command -v zenity >/dev/null || die "subaction dialogs require zenity"
+    case ${1:-} in
+        snap)     gui_snap ;;
+        restore)  gui_restore ;;
+        schedule) gui_schedule ;;
+        manage)   gui_manage ;;
+        doctor)   cmd_doctor | yad --text-info --title="leer doctor" \
+                           --width=620 --height=420 --font=monospace >/dev/null 2>&1 ;;
+        *) die "unknown gui subaction" ;;
+    esac
+}
+
+cmd_gui() {
+    load_conf
+    [[ ${1:-} == "--classic" ]] && { classic_hub; return 0; }
+    if ! command -v yad >/dev/null; then
+        classic_hub      # graceful fallback when yad is absent
+        return 0
+    fi
+    GUI_SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$LEER_BIN")
+    info "leer tray icon started — click it for actions. (Run 'pkill -f \"yad --notification\"' to stop.)"
+    exec yad --notification \
+        --image="drive-multidisk" \
+        --text="leer v$VERSION — config recovery ready" \
+        --menu="$(gui_tray_menu_string)" 2>/dev/null
+}
+
+
+cmd_gui_apply() {  # hidden: id [--etc] item... — performs an escalated selective apply
+    local id="" etc=no
+    load_conf
+    need_root "__gui_apply"
+    build_excludes
+    SELECTED=(); SEL_ETC=no
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --etc) etc=yes; shift;;
+            *) [[ -z $id ]] && { id=$1; shift; } || { SELECTED+=("$1"); shift; } ;;
+        esac
+    done
+    [[ -n $id && -f $SNAP_DIR/$id/MANIFEST ]] || die "invalid snapshot: '$id'"
+    (( ${#SELECTED[@]} > 0 || etc == yes )) || die "no items selected"
+    if [[ ${#SELECTED[@]} -gt 0 ]]; then
+        selected_run apply "$SNAP_DIR/$id" "$DEST_HOME"
+    fi
+    if [[ $etc == yes ]] && snap_captured_etc "$SNAP_DIR/$id"; then
+        etc_run apply "$SNAP_DIR/$id/etc" "$DEST_ETC/"
+    fi
+    echo "applied."
+}
+
+
+usage() {
+    cat <<EOF
+leer $VERSION - user config snapshot & selective restore
+
+usage:
+  leer snap [--tag MSG] [--quiet]     create a configuration snapshot
+  leer list                           list snapshots
+  leer diff <id> [<id2>|live]         compare snapshots or vs live system
+  sudo leer restore <id> [--pick]     restore; --pick opens interactive
+                                      file/dir chooser (zenity GUI when in
+                                      a desktop session, numbered menu on TTY)
+  sudo leer drop <id> [--yes]         delete one specific snapshot
+  sudo leer prune [<keep-n>]          delete oldest snapshots beyond N
+  sudo leer schedule set <preset>|--at '<expr>'|off
+                                      auto-snapshot timer (hourly..yearly or
+                                      any systemd OnCalendar expression)
+  leer schedule status                current schedule + next run
+  leer gui                            graphical hub (zenity): snapshot /
+                                      restore / schedule / manage
+  leer doctor                         sanity checks
+
+config: $CONF_PATH
+storage: /var/lib/leer/snapshots
+EOF
+}
+
+
+main() {
+    local args=() arg
+    for arg in "$@"; do
+        case $arg in
+            -q|--quiet) QUIET=yes;;
+            -y|--yes) FORCE=yes;;
+            -h|--help) usage; exit 0;;
+            -V|--version) printf 'leer %s\n' "$VERSION"; exit 0;;
+            *)
+                if [[ -z $MODE ]]; then MODE=$arg; else args+=("$arg"); fi
+                ;;
+        esac
+    done
+    [[ -n $MODE ]] || { usage; exit 0; }
+
+    case $MODE in
+        snap)    cmd_snap ${args[@]+"${args[@]}"};;
+        list)    cmd_list;;
+        diff)    cmd_diff ${args[@]+"${args[@]}"};;
+        restore) cmd_restore ${args[@]+"${args[@]}"};;
+        schedule) cmd_schedule ${args[@]+"${args[@]}"};;
+        gui)     cmd_gui ${args[@]+"${args[@]}"};;
+        __gui)   gui_subaction ${args[@]+"${args[@]}"};;
+        __gui_apply) cmd_gui_apply ${args[@]+"${args[@]}"};;
+        __esc)   shift; load_conf; gui_escalate ${args[@]+"${args[@]}"};;
+        drop)    cmd_drop ${args[@]+"${args[@]}"};;
+        prune)   cmd_prune ${args[@]+"${args[@]}"};;
+        doctor)  cmd_doctor;;
+        help)    usage;;
+        *)       usage >&2; die "unknown command: $MODE";;
+    esac
+}
+
+main "$@"
