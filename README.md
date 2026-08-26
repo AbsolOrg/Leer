@@ -64,7 +64,7 @@ counts (`3m/1d`). Type the numbers to restore (or `a` for all), confirm,
 and only those paths are written. Works identically on a desktop and over
 TTY/SSH.
 
-## Configuration — `/etc/leer.conf`
+## Configuration  (`/etc/leer.conf`)
 
 ```bash
 LEER_KEEP=10          # snapshots retained (auto-pruned)
