@@ -3,7 +3,7 @@
 **User-configuration snapshot & selective-restore tool for Arch-family systems.**
 
 leer takes versioned snapshots of your desktop + shell configuration, and lets you
-roll back — entirely or file-by-file — through an interactive terminal menu.
+roll back entirely or file-by-file through an interactive terminal menu.
 It is deliberately *not* a system-recovery tool: kernels, packages and boot
 states are out of scope (that's what btrfs/snapper or Timeshift are for).
 
@@ -32,7 +32,7 @@ Optional: none — everything runs in the terminal.
 |---|---|
 | `sudo leer snap [--tag MSG]` | create a snapshot |
 | `leer list` | history table |
-| `leer diff <id> [<id2>|live]` | what changed between states |
+| `leer diff <id> [<id2>\|live]` | what changed between states |
 | `sudo leer restore <id> [--pick]` | roll back (see picker below) |
 | `sudo leer drop <id> [--yes]` | delete one snapshot |
 | `sudo leer prune [<n>]` | keep newest n |
@@ -41,13 +41,13 @@ Optional: none — everything runs in the terminal.
 
 ## The restore picker (`--pick`)
 
-Lists every captured item at mixed granularity — `.config/sway/`, `.zshrc`,
+Lists every captured item at mixed granularity `.config/sway/`, `.zshrc`,
 `.themes/`, `/etc` as one unit. Items that differ from your current system are
 **pre-checked** with change counts (`3m/1d`). Untick anything you want left alone.
 
-Runs as a numbered terminal menu — identical on a desktop, over SSH, or from
+Runs as a numbered terminal menu identical on a desktop, over SSH, or from
 a TTY when the desktop is dead (Ctrl+Alt+F3). Deletions only ever apply inside paths you
-ticked — caches, histories and unrelated files can't be touched by accident.
+ticked caches, histories and unrelated files can't be touched by accident.
 
 ## Scheduling
 
@@ -58,7 +58,7 @@ Opt-in systemd timer: `hourly · daily · weekly · monthly · yearly` or any
 ## Interactive restore (`--pick`)
 
 `sudo leer restore <id> --pick` shows a numbered terminal menu of every
-captured item — `.config/sway/`, `.zshrc`, `.themes/`, `/etc` as one unit.
+captured item `.config/sway/`, `.zshrc`, `.themes/`, `/etc` as one unit.
 Items that differ from your current system are **pre-checked** with change
 counts (`3m/1d`). Type the numbers to restore (or `a` for all), confirm,
 and only those paths are written. Works identically on a desktop and over
@@ -95,7 +95,7 @@ GLOBAL_EXCLUDES=(…)   # basename patterns skipped everywhere
 
 ## Honest limitations
 
-- Snapshots live on the same disk — a total disk failure loses them too
+- Snapshots live on the same disk a total disk failure loses them too
 - Overlay restore doesn't remove files created *after* a snapshot
 - Arch-family only (pacman); multi-user systems: one home per invocation via
   `TARGET_HOME`
