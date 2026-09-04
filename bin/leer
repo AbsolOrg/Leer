@@ -444,6 +444,48 @@ cmd_prune() {
     fi
 }
 
+cmd_drop() {
+    local id="" yes=no quiet=$QUIET
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --yes|-y) yes=yes; shift;;
+            --quiet|-q) quiet=yes; shift;;
+            -h|--help) printf 'usage: sudo leer drop <id> [--yes]\n'; exit 0;;
+            *) [[ -z $id ]] || die "drop: unexpected argument '$1'"; id=$1; shift;;
+        esac
+    done
+    [[ -n $id ]] || die "usage: sudo leer drop <id> [--yes]"
+    case $id in ''|.|..|*/*) die "unsafe snapshot id: '$id'";; esac
+
+    load_conf
+    need_root drop
+
+    local snap="$SNAP_DIR/$id"
+    [[ -f $snap/MANIFEST ]] || die "no such snapshot: $id"
+
+    local total
+    total=$(snapshots | wc -l)
+    (( total > 1 )) || die "refusing to delete the last remaining snapshot"
+
+    local d_iso tag size
+    d_iso=$(sed -n 's/^DATE_ISO=//p' "$snap/MANIFEST")
+    tag=$(sed -n 's/^TAG=//p' "$snap/MANIFEST")
+    size=$(du -sh "$snap" 2>/dev/null | cut -f1)
+
+    if [[ $yes != yes && $FORCE != yes ]]; then
+        printf 'snapshot : %s\n' "$id"
+        printf '  date   : %s\n' "${d_iso:--}"
+        printf '  tag    : %s\n' "${tag:--}"
+        printf '  size   : %s\n' "${size:--}"
+        local ans
+        read -r -p "Permanently delete snapshot '$id'? Type 'yes' to continue: " ans
+        [[ $ans == yes ]] || { info "aborted."; return 0; }
+    fi
+
+    rm -rf -- "${SNAP_DIR:?}/$id"
+    [[ $quiet == yes ]] || info "dropped snapshot: $id"
+}
+
 # ------------------------- schedule (systemd timer) -------------------------
 
 sched_preset_valid() {
